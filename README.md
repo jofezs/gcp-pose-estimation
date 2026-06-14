@@ -36,16 +36,9 @@ Input Image (512x512)
   (x, y) ∈ [0,1]      (Cross / Square / L-Shape)
 ```
 
-**Why ResNet-34?**
-- Deep enough to learn the texture/edge patterns of painted ground markers against varied terrain (mud, gravel, concrete, vegetation)
-- Light enough to train quickly on a modest dataset and run inference efficiently — a single forward pass produces both outputs
-- ImageNet pretraining gives strong low-level feature extraction out of the box, which matters when fine-tuning on ~850 images
+A single ResNet-34 backbone feeds both heads. This works well because finding the marker center and identifying its shape rely on the same visual features — there is no benefit in running two separate models. A single forward pass at inference time gives both results.
 
-**Why a shared backbone?**
-The two tasks are not independent — the visual features that identify a marker as a "Cross" are the same features that localize its center. A shared backbone is more sample-efficient than two separate networks and keeps the model simple to train and deploy.
-
-**Why direct regression instead of heatmaps?**
-There is exactly one keypoint per image and the marker occupies a small, well-defined region. Heatmap-based approaches add significant complexity and compute without a meaningful benefit at this scale. A regressed normalized coordinate is also simpler to post-process and directly interpretable against the PCK metric.
+ResNet-34 was chosen because it is pre-trained on ImageNet (strong starting point), not too large to overfit on ~850 images, and fast enough to train and run inference without a high-end GPU.
 
 ---
 
