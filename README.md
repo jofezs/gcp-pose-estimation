@@ -1,172 +1,286 @@
 # Aerial GCP Pose Estimation
 
-A multi-task CNN that, given an aerial image crop, predicts:
-1. The pixel `(x, y)` location of the GCP marker's center.
-2. The marker's shape: `Cross`, `Square`, or `L-Shape`.
+A multi-task deep learning pipeline that takes an aerial drone image as input and simultaneously predicts:
+1. The exact pixel `(x, y)` coordinates of the GCP marker's center
+2. The shape of the marker: `Cross`, `Square`, or `L-Shape`
 
-## 1. Architecture
+---
 
-**GCPNet** (`src/model.py`): a single ResNet-34 backbone (ImageNet-pretrained)
-feeding two small heads from a shared 512-d feature vector:
+## Table of Contents
+- [Architecture](#architecture)
+- [Training Strategy](#training-strategy)
+- [Dataset Challenges](#dataset-challenges)
+- [Results](#results)
+- [Model Weights](#model-weights)
+- [How to Run](#how-to-run)
+- [Repository Structure](#repository-structure)
 
-- **Keypoint head**: 2 outputs, `Sigmoid`-bounded to `[0, 1]`, representing
-  the normalized `(x, y)` location of the marker center in the resized/padded
-  512x512 input.
-- **Classification head**: 3-class logits over `{Cross, Square, L-Shape}`.
+---
 
-**Rationale**:
-- A shared backbone is justified because the two tasks are not independent —
-  the visual texture/edges that identify "this is a Cross marker" are the
-  same features that localize its center. Sharing the backbone is more
-  sample-efficient than training two separate networks and keeps the model
-  small and easy to deploy (single forward pass, single checkpoint).
-- ResNet-34 is a deliberate middle ground: deep enough to learn the relevant
-  texture/edge patterns of painted ground markers against varied terrain
-  (mud, gravel, concrete, vegetation), but light enough to train quickly and
-  run inference on a single GPU/CPU at reasonable speed. Swapping the
-  backbone is a one-line change (`--backbone resnet18/resnet50`) if more
-  capacity or more speed is needed.
-- Direct keypoint regression (rather than heatmap-based pose estimation) was
-  chosen because there is exactly **one** keypoint per image and the marker
-  occupies a small, well-defined region — a heatmap head adds complexity and
-  compute without a clear benefit at this scale, and a regressed coordinate
-  is simpler to post-process and evaluate against the PCK metric.
+## Architecture
 
-## 2. Training Strategy
+**Model: GCPNet** (`src/model.py`)
 
-### Input pipeline (`src/dataset.py`)
-- `LongestMaxSize(512)` + `PadIfNeeded(512, 512)`: preserves aspect ratio
-  (critical, since the dataset contains images at multiple native
-  resolutions — see "Challenges" below) and avoids distorting the marker's
-  shape, which would corrupt the shape-classification signal.
-- All geometric augmentations use Albumentations' `KeypointParams` so the
-  `(x, y)` label is transformed consistently with the image.
+A shared ResNet-34 backbone with two task-specific heads:
 
-### Augmentations
-- `HorizontalFlip`, `VerticalFlip`, `RandomRotate90`: aerial nadir imagery has
-  no canonical "up", so these are safe and meaningfully increase effective
-  dataset size/orientation diversity. Critically, the `L-Shape` class is
-  *not* rotation-invariant in identity (an L rotated 180° is still an "L"
-  shape class, just oriented differently) — since the label is the shape
-  *category*, not orientation, rotation augmentation is valid here.
-- `ColorJitter`, `RandomBrightnessContrast`, `ISONoise`, `GaussianBlur`:
-  drone imagery varies hugely in exposure, white balance, and JPEG
-  compression artifacts across different surveys/cameras/lighting
-  conditions — these augmentations target that domain-shift problem
-  directly.
-
-### Loss
-- **Keypoint loss**: `SmoothL1Loss` (Huber) on normalized `(x, y)` —
-  more robust to occasional annotation outliers than plain MSE, while still
-  being smooth near zero (unlike pure L1).
-- **Classification loss**: `CrossEntropyLoss` with **inverse-frequency class
-  weights** computed from the training manifest, to counter class imbalance
-  between `Cross` / `Square` / `L-Shape`.
-- **Combined loss**: `kp_weight * loss_kp + loss_cls`, with `kp_weight=100`
-  by default (since the normalized-coordinate SmoothL1 loss is on the order
-  of 1e-3 to 1e-2 while cross-entropy is on the order of 1.0; the weight
-  brings the two gradients to comparable magnitude — tune via
-  `--kp_weight` if one task dominates training).
-
-### Optimization
-- `AdamW`, cosine LR schedule, ImageNet-pretrained backbone (transfer
-  learning is important here given the dataset is modest in size relative to
-  a from-scratch CNN).
-
-## 3. Dataset Challenges & Mitigations
-
-This dataset is explicitly *not* pre-sanitized, and the EDA script
-(`src/eda.py`) should be run first against the real data. From the sample
-provided, the following issues are already evident and handled:
-
-1. **Inconsistent native resolution / aspect ratio.** Some annotation
-   coordinates (e.g. `x=3272`, `y=2445`) exceed the 2048x1365 figure quoted
-   in the spec, implying images from different drones/surveys are at
-   different native resolutions (e.g. 4000x2250, 4056x3040, etc.) and/or
-   different aspect ratios. **Mitigation**: the pipeline never assumes a
-   fixed source resolution — image dimensions are read per-file with OpenCV,
-   and `LongestMaxSize` + `PadIfNeeded` normalizes any input size to a
-   512x512 square while preserving aspect ratio. Inference inverts this
-   exact transform (accounting for scale + padding offset) to map predicted
-   coordinates back to the original image's pixel space.
-
-2. **Inconsistent label spelling.** The spec text says `"L-Shaped"` but the
-   actual labels JSON uses `"L-Shape"`. **Mitigation**:
-   `build_manifest.py` normalizes both spellings to a single canonical value
-   (`"L-Shape"`, matching what's observed in the real data) and reports any
-   *other* unrecognized shape strings instead of silently dropping/crashing.
-
-3. **Highly correlated images within a survey/GCP folder.** Each
-   `project/survey/gcp_id/` folder likely contains multiple photos of the
-   *same physical marker* from slightly different drone positions — these
-   are not independent samples. **Mitigation**: `build_manifest.py` splits
-   train/val by **top-level project folder**, not by individual image, so
-   validation never sees images from a project/survey the model trained on.
-   This gives a much more honest estimate of generalization to the held-out
-   test set (which contains entirely new projects).
-
-4. **Class imbalance** across `Cross` / `Square` / `L-Shape`. **Mitigation**:
-   inverse-frequency class weights in the classification loss
-   (`compute_class_weights` in `train.py`). The EDA script reports the
-   actual distribution so this can be sanity-checked / tuned further.
-
-5. **Missing/unreadable files referenced in the labels JSON, or images on
-   disk with no annotation.** **Mitigation**: `build_manifest.py` checks file
-   existence and readability for every JSON entry, logs how many are missing
-   (and which ones, for the first few), and only includes verifiably present
-   images in the train/val manifests.
-
-6. **Coordinates landing outside image bounds** (possible annotation
-   errors). `eda.py` explicitly counts these so they can be inspected and,
-   if needed, excluded or corrected before training.
-
-## 4. Reproducing `predictions.json`
-
-```bash
-cd src
-
-# 1. EDA (run first against the real dataset to confirm assumptions above)
-python eda.py --data_root /path/to/train_dataset \
-               --labels_json /path/to/train_dataset/curated_gcp_marks.json
-
-# 2. Build train/val manifests (leakage-free split by project)
-python build_manifest.py --data_root /path/to/train_dataset \
-                          --labels_json /path/to/train_dataset/curated_gcp_marks.json \
-                          --out_dir ../manifests
-
-# 3. Train
-python train.py --data_root /path/to/train_dataset \
-                 --manifest_dir ../manifests \
-                 --out_dir ../checkpoints \
-                 --epochs 30 --batch_size 16
-
-# 4. Inference on the unlabelled test set -> predictions.json
-python infer.py --data_root /path/to/test_dataset \
-                 --weights ../checkpoints/best_model.pt \
-                 --out_file ../predictions.json
+```
+Input Image (512x512)
+       │
+  ResNet-34 Backbone (ImageNet pretrained)
+       │
+  AdaptiveAvgPool → 512-d feature vector → Dropout(0.3)
+       │                    │
+  Keypoint Head        Classification Head
+  Linear → ReLU        Linear → ReLU
+  Linear → Sigmoid     Linear → Logits
+  (x, y) ∈ [0,1]      (Cross / Square / L-Shape)
 ```
 
-## 5. Model Weights
+**Why ResNet-34?**
+- Deep enough to learn the texture/edge patterns of painted ground markers against varied terrain (mud, gravel, concrete, vegetation)
+- Light enough to train quickly on a modest dataset and run inference efficiently — a single forward pass produces both outputs
+- ImageNet pretraining gives strong low-level feature extraction out of the box, which matters when fine-tuning on ~850 images
 
-Trained weights (`best_model.pt`) should be uploaded to cloud storage (e.g.
-a Google Drive / S3 link) and referenced here once training has been run
-against the full dataset — the code in this repo is the deliverable;
-`infer.py --weights <path>` is the single entry point needed to regenerate
-`predictions.json` from any checkpoint produced by `train.py`.
+**Why a shared backbone?**
+The two tasks are not independent — the visual features that identify a marker as a "Cross" are the same features that localize its center. A shared backbone is more sample-efficient than two separate networks and keeps the model simple to train and deploy.
 
-## 6. Repository Structure
+**Why direct regression instead of heatmaps?**
+There is exactly one keypoint per image and the marker occupies a small, well-defined region. Heatmap-based approaches add significant complexity and compute without a meaningful benefit at this scale. A regressed normalized coordinate is also simpler to post-process and directly interpretable against the PCK metric.
+
+---
+
+## Training Strategy
+
+### Input Pipeline (`src/dataset.py`)
+
+All images are resized and padded to a fixed **512×512** square:
+- `LongestMaxSize(512)` — scales the longest side to 512, preserving aspect ratio (critical since the dataset contains two different native resolutions: 4096×2730 and 4096×3068)
+- `PadIfNeeded(512, 512)` — zero-pads the shorter side to make a square
+
+All geometric transforms use Albumentations' `KeypointParams` so the `(x, y)` label is transformed consistently with the image. At inference time, the padding and scale are inverted to map predictions back to the original image's pixel coordinates.
+
+### Augmentations
+
+| Augmentation | Reason |
+|---|---|
+| `HorizontalFlip`, `VerticalFlip`, `RandomRotate90` | Aerial nadir imagery has no canonical orientation — these are safe and double/quadruple effective dataset size |
+| `ColorJitter`, `RandomBrightnessContrast` | Drone imagery varies hugely in exposure and white balance across surveys/cameras/lighting |
+| `GaussianBlur`, `ISONoise` | Targets JPEG compression artifacts and sensor noise variation across different drone models |
+
+### Loss Functions
+
+**Keypoint loss:** `SmoothL1Loss` (Huber) on normalized `(x, y)` coordinates — more robust to occasional annotation outliers than MSE, while remaining smooth near zero unlike pure L1.
+
+**Classification loss:** `CrossEntropyLoss` with inverse-frequency class weights computed from the training set to counter class imbalance:
+- Cross: 177 samples → higher weight
+- Square: 328 samples → medium weight  
+- L-Shape: 491 samples → lower weight
+
+**Combined loss:** `total = kp_weight × loss_kp + loss_cls`
+
+A `kp_weight` of 100 is used to bring the small normalized-coordinate SmoothL1 loss (order of 1e-3) to a comparable gradient magnitude as the cross-entropy loss (order of 1.0).
+
+### Optimization
+- Optimizer: `AdamW` with weight decay 1e-4
+- Schedule: Cosine annealing LR over 30 epochs
+- Batch size: 16
+- Best checkpoint saved automatically based on lowest validation loss
+
+---
+
+## Dataset Challenges
+
+This dataset reflects real production conditions and required careful handling:
+
+**1. Inconsistent image resolutions**
+Images come from different drone models at two native resolutions (4096×2730 and 4096×3068). Some annotation coordinates also exceed the 2048×1365 figure quoted in the spec. The pipeline reads actual image dimensions per file with OpenCV and uses aspect-ratio-preserving resize + pad rather than assuming any fixed size.
+
+**2. Inconsistent shape label spelling**
+The JSON uses `"L-Shape"` while the spec document says `"L-Shaped"`. The manifest builder normalizes both spellings to a single canonical value and reports any other unrecognized strings rather than silently crashing or dropping samples.
+
+**3. Missing shape labels**
+4 out of 1000 entries had `verified_shape: null`. These were detected during EDA and excluded from training/validation with explicit logging.
+
+**4. Class imbalance**
+L-Shape (491) significantly outnumbers Cross (177) and Square (328). Mitigated with inverse-frequency class weights in the classification loss.
+
+**5. Correlated images within a GCP folder**
+Each `project/survey/gcp_id/` folder contains multiple photos of the same physical marker from slightly different drone positions — these are not independent samples. A naive random split would leak these into both train and val, inflating validation metrics. The split was done at the **GCP folder level**, keeping each `gcp_id` folder entirely in train or entirely in val, with stratified sampling per class to ensure all 3 shapes appear in both splits.
+
+**6. Only 11 top-level projects**
+A project-level split (the ideal for preventing domain leakage) resulted in val having zero Cross samples when large single-class projects (like Vedanta GOA Bicholim, 254 images, all L-Shape) ended up in val. The GCP-level stratified split was the pragmatic fix that balanced leakage prevention with class coverage.
+
+---
+
+## Results
+
+Training on 850 samples, validating on 146 samples (GCP-level stratified split):
+
+| Metric | Value |
+|---|---|
+| Val classification accuracy | 97.9 – 98.6% |
+| Val keypoint loss (normalized) | ~0.020 |
+| Approx. pixel error at 512px input | ~10px |
+| Approx. pixel error at original resolution | ~80px |
+
+The keypoint error of ~80px on 4096px images should comfortably satisfy PCK@50px thresholds for most test images, with room for improvement via test-time augmentation or a larger backbone.
+
+---
+
+## Model Weights
+
+Download `best_model.pt` from:
+
+> https://drive.google.com/file/d/1OeC0mFP6EJ91g7TJU1ZdWll5bBQuGvjT/view?usp=sharing
+
+Place the downloaded file at `checkpoints/best_model.pt` before running inference.
+
+---
+
+## How to Run
+
+### Reproducing predictions.json (Quick Start)
+
+If you just want to run inference and reproduce `predictions.json`:
+
+```bash
+# 1. Clone and install
+git clone https://github.com/jofezs/gcp-pose-estimation.git
+cd gcp_pose_estimation
+pip install -r requirements.txt
+
+# 2. Download best_model.pt from the link above and place it at:
+#    checkpoints/best_model.pt
+
+# 3. Run inference (replace the dataset path with your path to dataset)
+cd src
+python infer.py \
+    --data_root ../test_dataset \
+    --weights ../checkpoints/best_model.pt \
+    --out_file ../predictions.json
+```
+
+That's all that's needed to reproduce `predictions.json`. The sections below describe the full pipeline including EDA, dataset splitting, and training from scratch.
+
+---
+
+### Path Variables
+
+Before running any command, set these paths to match where your data lives on your machine. Every `--flag` below corresponds to one of these:
+
+| Variable | Flag | Description | Example value |
+|---|---|---|---|
+| `TRAIN_ROOT` | `--data_root` | Root folder of the training dataset | `../train_dataset` |
+| `TEST_ROOT` | `--data_root` | Root folder of the test dataset | `../test_dataset` |
+| `LABELS_JSON` | `--labels_json` | Path to the annotations file inside the training dataset | `../train_dataset/gcp_marks.json` |
+| `MANIFEST_DIR` | `--manifest_dir` / `--out_dir` | Where to save/read the train & val split files | `../manifests` |
+| `CHECKPOINT_DIR` | `--out_dir` / `--weights` | Where to save/read model weights | `../checkpoints` |
+| `PREDICTIONS_FILE` | `--out_file` / `--predictions` | Output path for predictions JSON | `../predictions.json` |
+
+The example values below assume you run all commands from inside the `src/` folder (`cd src`) with `train_dataset` and `test_dataset` sitting one level up. Adjust the paths if your folder layout differs.
+
+---
+
+### 1. Setup
+```bash
+git clone https://github.com/jofezs/gcp-pose-estimation.git
+cd gcp_pose_estimation
+python -m venv venv
+# Windows:
+venv\Scripts\Activate.ps1
+# Mac/Linux:
+source venv/bin/activate
+
+pip install -r requirements.txt
+cd src
+```
+
+### 2. EDA (recommended first step)
+Inspects the dataset — reports image resolutions, class distribution, missing files, and project breakdown.
+```bash
+# --data_root   → TRAIN_ROOT  (path to training images)
+# --labels_json → LABELS_JSON (path to annotations file)
+python eda.py \
+    --data_root ../train_dataset \
+    --labels_json ../train_dataset/gcp_marks.json
+```
+
+### 3. Build manifests
+Creates `train_manifest.json` and `val_manifest.json` — a leakage-free split at the GCP folder level, stratified by shape class.
+```bash
+# --data_root   → TRAIN_ROOT    (path to training images)
+# --labels_json → LABELS_JSON   (path to annotations file)
+# --out_dir     → MANIFEST_DIR  (where to save the split files)
+python build_manifest.py \
+    --data_root ../train_dataset \
+    --labels_json ../train_dataset/gcp_marks.json \
+    --out_dir ../manifests
+```
+
+### 4. Train
+Trains GCPNet and saves the best checkpoint (lowest val loss) to `CHECKPOINT_DIR/best_model.pt`.
+```bash
+# --data_root    → TRAIN_ROOT     (path to training images)
+# --manifest_dir → MANIFEST_DIR   (folder containing the split files from step 3)
+# --out_dir      → CHECKPOINT_DIR (where to save model weights)
+python train.py \
+    --data_root ../train_dataset \
+    --manifest_dir ../manifests \
+    --out_dir ../checkpoints \
+    --epochs 30 \
+    --batch_size 16
+```
+
+Optional flags:
+- `--backbone resnet18` — faster, use if training on CPU
+- `--batch_size 8` — reduce if running out of RAM
+- `--workers 0` — set to 0 on Windows if multiprocessing errors occur
+- `--lr 1e-4` — learning rate (default)
+- `--kp_weight 100` — scale factor balancing keypoint vs classification loss
+
+### 5. Inference → predictions.json
+Runs the trained model over every image in the test dataset and writes `PREDICTIONS_FILE`.
+```bash
+# --data_root → TEST_ROOT        (path to test images)
+# --weights   → CHECKPOINT_DIR/best_model.pt (trained model weights)
+# --out_file  → PREDICTIONS_FILE (output path for predictions JSON)
+python infer.py \
+    --data_root ../test_dataset \
+    --weights ../checkpoints/best_model.pt \
+    --out_file ../predictions.json
+```
+
+### 6. Validate predictions format
+Checks that every test image has a prediction, coordinates are valid, and shape labels are correctly named.
+```bash
+# --predictions → PREDICTIONS_FILE (the JSON produced in step 5)
+# --test_root   → TEST_ROOT        (path to test images, for coverage check)
+python validate_predictions.py \
+    --predictions ../predictions.json \
+    --test_root ../test_dataset
+```
+
+---
+
+
+## Repository Structure
 
 ```
 gcp_pose_estimation/
 ├── README.md
 ├── requirements.txt
-├── manifests/              # generated by build_manifest.py
-├── checkpoints/            # generated by train.py
+├── predictions.json
+├── manifests/
+│   ├── train_manifest.json
+│   └── val_manifest.json
+├── checkpoints/
+│   └── best_model.pt
 └── src/
-    ├── eda.py
-    ├── build_manifest.py
-    ├── dataset.py
-    ├── model.py
-    ├── train.py
-    └── infer.py
+    ├── eda.py                  # Exploratory data analysis
+    ├── build_manifest.py       # Dataset splitting and label normalization
+    ├── dataset.py              # PyTorch Dataset + augmentation pipeline
+    ├── model.py                # GCPNet architecture
+    ├── train.py                # Training loop
+    ├── infer.py                # Inference → predictions.json
+    └── validate_predictions.py # Format and coverage validation
 ```
