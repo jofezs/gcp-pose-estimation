@@ -1,0 +1,8 @@
+train_dataset/
+test_dataset/
+venv/
+checkpoints/
+__pycache__/
+*.pt
+*.pyc
+.DS_Store
